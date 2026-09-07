@@ -10,8 +10,8 @@ differ in how they reach the internet.
 | LoRa gateway | `1_LoRa_System/Gateway/AWD_LoRa_Gateway_V11/` | E220-900T30D LoRa in, Quectel EC200U 4G out | [gateway](1_LoRa_System/Gateway/README.md) |
 | LoRa nodes (5) | `1_LoRa_System/Nodes/AWD_LoRa_Node1_V6/` … `Node5` | E220-900T22D LoRa to the gateway | [nodes](1_LoRa_System/Nodes/README.md) |
 | LoRa Apps Script | `1_LoRa_System/AppsScript/` | Google Sheets backend for the gateway | [script](1_LoRa_System/AppsScript/README.md) |
-| Standalone GSM | `2_Standalone_GSM/AWD_GSM_Monitor_V3/` | Quectel EC200U 4G, WiFi fallback, SMS | [gsm](2_Standalone_GSM/README.md) |
-| Standalone WiFi | `3_Standalone_WiFi/AWD_WiFi_Monitor_V8/` | WiFi only (saved SSID or open hotspot) | [wifi](3_Standalone_WiFi/README.md) |
+| Standalone GSM | `2_AWD_GSM_Monitor_V3/` | Quectel EC200U 4G, WiFi fallback, SMS | [gsm](2_AWD_GSM_Monitor_V3/README.md) |
+| Standalone WiFi | `3_AWD_WiFi_Monitor_V8/` | WiFi only (saved SSID or open hotspot) | [wifi](3_AWD_WiFi_Monitor_V8/README.md) |
 
 Release notes for every build: `CHANGELOG.md`.
 
@@ -23,8 +23,8 @@ AWD_Digital_Firmware/
 │   ├── Gateway/AWD_LoRa_Gateway_V11/    one sketch, flash to the gateway
 │   ├── Nodes/AWD_LoRa_Node1_V6 … Node5  one sketch per field node
 │   └── AppsScript/Code.gs               Google Sheets backend
-├── 2_Standalone_GSM/AWD_GSM_Monitor_V3/
-└── 3_Standalone_WiFi/AWD_WiFi_Monitor_V8/
+├── 2_AWD_GSM_Monitor_V3/
+└── 3_AWD_WiFi_Monitor_V8/
 ```
 
 Each numbered folder has its own README.md. Open a sketch folder in the

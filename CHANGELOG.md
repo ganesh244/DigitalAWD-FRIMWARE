@@ -194,7 +194,7 @@
     1_LoRa_System/         Gateway V11, nodes V6, Apps Script V7.
                                  Full notes + bench checklist in its README.md.
     
-    2_Standalone_GSM/AWD_GSM_Monitor_V3/        Standalone GSM (EC200U, Jio). Changes (V3-n in code):
+    2_AWD_GSM_Monitor_V3/        Standalone GSM (EC200U, Jio). Changes (V3-n in code):
       V3-1  Reading saved to LittleFS BEFORE the modem runs (write-ahead). A
             brownout during LTE no longer loses the cycle. One upload path.
       V3-2  Modem always set to CFUN=0 when it answered AT, even after a
@@ -217,7 +217,7 @@
       Not fixed in software (hardware): ECHO on GPIO12 strapping pin; the
       modem has no PWRKEY wired so it is never fully powered down (~20 mA).
     
-    3_Standalone_WiFi/AWD_WiFi_Monitor_V8/  Standalone WiFi. Changes (V8-n in code):
+    3_AWD_WiFi_Monitor_V8/  Standalone WiFi. Changes (V8-n in code):
       V8-1  Reading saved to LittleFS before WiFi (write-ahead); direct-send
             path removed, syncAllToSheets() sends everything.
       V8-2  Batch JSON overflow: the 4 KB doc dropped ~1/3 of every 20-record
