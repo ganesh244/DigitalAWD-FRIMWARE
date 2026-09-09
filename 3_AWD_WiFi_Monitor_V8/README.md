@@ -24,18 +24,44 @@ only used as overflow when LittleFS is 75 % full.
 1. Mount LittleFS (format only after 3 failed mounts), RTC, SD. Merge
    any temp file left by a crash. Load config.
 2. **Read the sensor and append the record to `/data.txt`.**
-3. Scan for networks. This happens on **every** wake and takes about
-   2.5 s. There is no boot-skipping backoff, because the whole point is
-   to catch a hotspot during the short window it is switched on.
-4. Connect, but only to something the scan actually saw:
-   the saved SSID first (15 s), otherwise the two strongest open
-   networks (10 s each), each verified with a connectivity probe. If
-   neither is in range the radio goes straight back off.
+3. Decide whether to look for WiFi at all (see **How a sync happens**).
+   A reset always looks; a timer wake normally does not.
+4. If looking: one scan, then connect only to something the scan saw.
+   The saved SSID first (15 s), otherwise the two strongest open
+   networks (10 s each), each verified with a connectivity probe. An
+   empty field costs about 3 s and the radio goes straight back off.
 5. Online: correct the clock, then `syncAllToSheets()` posts `/data.txt`
-   and the SD backup in batches of 10 through the raw TLS client that
+   and the SD backup in batches of 40 through the raw TLS client that
    follows the Apps Script 302 redirect. Failed batches are kept.
 6. Deep sleep for the configured interval, or 60 s when the level moved
    more than 5 cm since the last reading (smart sleep).
+
+## How a sync happens
+
+There is no WiFi in the field, so this device is designed around a
+deliberate, human-triggered sync:
+
+1. The farmer switches on a phone hotspot with the SSID and password
+   that are saved in the device config.
+2. The farmer presses the **reset button** (or power-cycles the device).
+3. The device treats that reset as a sync command: it looks for the
+   network, uploads everything it has buffered, corrects its clock, and
+   goes back to sleep.
+
+In practice this happens every month or two, or after a harvest. Hold
+the hotspot open until the serial log or the sheet shows the upload
+finished. Two months of hourly readings is roughly 1400 records, which
+upload in about three minutes.
+
+Timer wakes do not normally touch the radio, because there is nothing
+to find and ~1400 pointless scans between visits would waste battery.
+Two safety nets exist: a routine look about once a day, and a more
+frequent one if the flash buffer ever passes 60 % full.
+
+Reset detection deliberately ignores brownout, panic and watchdog
+resets. Only a real power-on or reset-button press counts, so a device
+with a weak battery cannot fall into a loop of resetting and retrying
+WiFi.
 
 ## Record format
 

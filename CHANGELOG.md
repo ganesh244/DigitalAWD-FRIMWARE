@@ -251,13 +251,20 @@
             block NTP's UDP port 123, so NTP alone could never fix a wrong
             RTC in the field. The header is already being read, so this
             costs no extra radio time and is accurate to a second or two.
-      V8-17 WiFi acquisition reworked: scan first (every wake, ~2.5 s), then
-            connect only to a network the scan actually saw. Removes the
-            old "skip WiFi for 5 boots after 3 failures" backoff, which made
-            the device deaf for five hours at a stretch and could miss the
-            short window when a farmer's hotspot is switched on. Also stops
-            blind-dialling the saved SSID for 15 s when it is not in range,
-            so the common no-network wake is now far cheaper than before.
+      V8-17 WiFi acquisition reworked around the real operating model: there
+            is no WiFi in the field at all, and a sync happens when a farmer
+            switches on a phone hotspot and presses the reset button, once a
+            month or two or after harvest. The reset button is therefore
+            treated as the sync command and always tries. Timer wakes take a
+            cheap look about once a day, or every 6 wakes once the buffer
+            passes 60 % full, and skip the radio otherwise. When a look does
+            happen it scans first and connects only to a network the scan
+            saw, instead of blind-dialling the saved SSID for 15 s in an
+            empty field, so each check costs roughly 3 s instead of 20 s.
+      V8-18 Upload batch 10 -> 40 records. A month or two of hourly readings
+            is 700-1400 buffered rows, which at 10 per upload meant up to
+            144 TLS round trips and close to ten minutes of the farmer
+            holding the hotspot open. At 40 it is about three minutes.
       Note: 95 % of the 1.2 MB app partition. Use "Minimal SPIFFS" partition
       if you add more code, or drop TelnetStream (never started anyway).
     

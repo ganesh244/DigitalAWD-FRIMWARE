@@ -46,12 +46,17 @@
 //         by every upload. This device reaches the internet through phone
 //         hotspots, which block NTP, so NTP alone could never fix a wrong
 //         RTC in the field. The header costs nothing: it is already read.
-//   V8-17 WiFi acquisition reworked to scan first, then connect only to a
-//         network the scan actually saw, and to do this on EVERY wake.
-//         The old design blind-dialled the saved SSID for 15 s even when
-//         absent, and went deaf for five boots after three failures, which
-//         is how a farmer's short hotspot window gets missed. Scanning
-//         every boot costs about 2.5 s and is the cheaper behaviour.
+//   V8-17 WiFi acquisition reworked around how the device is really used:
+//         there is no WiFi in the field, and a sync happens when a farmer
+//         switches on a hotspot and presses reset, once a month or two.
+//         The reset button is therefore the sync command and always tries.
+//         Timer wakes only take a cheap look about once a day (more often
+//         if the buffer is filling). When we do look we scan first and
+//         connect only to a network the scan saw, instead of blind-dialling
+//         the saved SSID for 15 s in an empty field.
+//   V8-18 Upload batch 10 -> 40 records. A month or two of hourly readings
+//         is 700-1400 records; at 10 per upload the farmer had to hold the
+//         hotspot open for the best part of ten minutes.
 // ============================================================
 #define PORTAL_TIMEOUT_MS   600000UL
 
@@ -160,17 +165,20 @@ static uint32_t bodSaved = 0;   // V8-6
 RTC_DATA_ATTR uint32_t deepSleepSeconds  = NORMAL_SLEEP_SECONDS;
 
 // ── WiFi state (survives deep sleep in RTC memory) ──
-// V8-17: there is no longer a "skip WiFi for N boots" backoff. This device
-// depends on catching a phone hotspot during a short, unpredictable window,
-// and going deaf for hours at a time is how those windows get missed. Every
-// wake now performs one cheap scan (~2.5 s) and only spends real connect
-// time on a network that scan actually saw.
+// There is no WiFi in the field. A sync happens when the farmer switches on
+// a phone hotspot and presses reset, roughly every month or two. So a timer
+// wake almost never has a network to find, and looking on every wake would
+// waste power across the ~1400 wakes between two visits.
 //
-// wifiFailStreak survives sleep and does one job: after several failures in
-// a row it stops the device retrying unknown OPEN networks every boot, which
-// is what a nearby captive portal would otherwise cost. The scan and the
-// saved-network connect are never skipped.
-#define WIFI_OPEN_SKIP_AFTER_FAILURES  5   // stop trying open APs after this many
+// The reset button is the real sync trigger and is never skipped. These two
+// numbers only govern the safety-net checks on timer wakes, in units of wake
+// cycles (one hour each by default).
+#define WIFI_IDLE_CHECK_BOOTS    24   // routine look, about once a day
+#define WIFI_URGENT_CHECK_BOOTS   6   // when the flash buffer is filling up
+// After this many consecutive failures the device stops retrying unknown
+// OPEN networks, so a captive portal near the field cannot drain it. The
+// saved hotspot is always still tried.
+#define WIFI_OPEN_SKIP_AFTER_FAILURES  5
 RTC_DATA_ATTR uint32_t wifiFailStreak    = 0;   // consecutive offline boots
 RTC_DATA_ATTR uint32_t bootsSinceSync    = 0;   // boots since last successful sync
 RTC_DATA_ATTR uint32_t bootsSinceAttempt = 0;   // boots since last WiFi attempt
@@ -735,7 +743,14 @@ bool flushLfsToSheets() {
 
   // FIX: Stack-allocating String batchLines[50] inside a loop burns ~25 KB
   // of stack per iteration on ESP32. Use a fixed small batch with heap strings.
-  const int BATCH = 10;      // V8-2: 10 records fit an 8 KB doc with margin
+  // V8-18: 40 records per upload, not 10. A sync happens once a month or
+  // two, so the backlog is 700-1400 readings and the farmer is standing
+  // there with a hotspot on while it drains. At 10 per upload that is up
+  // to 144 TLS round trips, close to ten minutes; at 40 it is about three.
+  // (V8-2 fixed the real bug here, which was the batch silently
+  // overflowing its document and discarding records while counting them
+  // as sent. The add() below is checked, so a larger batch is safe.)
+  const int BATCH = 40;
   int sent = 0;
   int kept = 0;  // FIX: track failed records with a counter, NOT keep.size().
                  // LittleFS doesn't flush file metadata (size) until close() is
@@ -747,7 +762,7 @@ bool flushLfsToSheets() {
     wdt_feed();
     std::vector<String> batchLines;
     batchLines.reserve(BATCH);
-    DynamicJsonDocument batch(8192);
+    DynamicJsonDocument batch(32768);
     JsonArray arr = batch.to<JsonArray>();
 
     while (src.available() && (int)batchLines.size() < BATCH) {
@@ -823,7 +838,14 @@ bool flushSdToSheets() {
     return false;
   }
 
-  const int BATCH = 10;      // V8-2: 10 records fit an 8 KB doc with margin
+  // V8-18: 40 records per upload, not 10. A sync happens once a month or
+  // two, so the backlog is 700-1400 readings and the farmer is standing
+  // there with a hotspot on while it drains. At 10 per upload that is up
+  // to 144 TLS round trips, close to ten minutes; at 40 it is about three.
+  // (V8-2 fixed the real bug here, which was the batch silently
+  // overflowing its document and discarding records while counting them
+  // as sent. The add() below is checked, so a larger batch is safe.)
+  const int BATCH = 40;
   int sent = 0;
   int kept = 0;  // FIX: same keep.size()-before-close() bug as LFS flush
 
@@ -831,7 +853,7 @@ bool flushSdToSheets() {
     wdt_feed();
     std::vector<String> batchLines;
     batchLines.reserve(BATCH);
-    DynamicJsonDocument batch(8192);
+    DynamicJsonDocument batch(32768);
     JsonArray arr = batch.to<JsonArray>();
 
     while (src.available() && (int)batchLines.size() < BATCH) {
@@ -1089,54 +1111,66 @@ void setup() {
   // with setInsecure() — no global client needed.
 
   // ============================================================
-  //  WiFi STATE MACHINE — scan first, then decide  (V8-17)
+  //  WiFi STATE MACHINE  (V8-17)
   //
-  //  This unit lives offline. It buffers readings in flash and depends on
-  //  catching a farmer's phone hotspot during the short window it is
-  //  switched on. Two consequences shape this code:
+  //  HOW THIS DEVICE IS ACTUALLY USED
+  //  There is no WiFi in the field. Ever. The sync is a deliberate human
+  //  action: the farmer switches a phone hotspot on, presses the reset
+  //  button, and the device uploads everything it has been buffering.
+  //  That happens perhaps once a month or two, or after a harvest.
   //
-  //   1. Never go deaf. The previous design skipped WiFi entirely for five
-  //      boots after three failures — five hours at the default interval,
-  //      which is exactly how a visiting farmer's hotspot gets missed. We
-  //      now look on every single wake.
+  //  So the reset button IS the sync command, and it is the primary path
+  //  here. On a timer wake there is essentially never a network to find,
+  //  and hunting for one is pure battery waste across the ~1400 wakes
+  //  between two visits.
   //
-  //   2. Scanning is not the expensive part. A scan takes about 2.5 s; a
-  //      blind WiFi.begin() to an absent access point costs the full 15 s
-  //      timeout, and in a field the access point is absent most of the
-  //      time. So we scan once, then spend connect time only on a network
-  //      we can actually see. Looking every boot this way is cheaper than
-  //      the old backoff was on the boots it did not skip.
+  //   • Physical reset (power-on or EN button) → always try. This is the
+  //     farmer asking for a sync, and it must never be skipped.
+  //   • Buffer filling up → try every WIFI_URGENT_CHECK_BOOTS, so data is
+  //     not lost if nobody comes for a very long time.
+  //   • Otherwise → one cheap look every WIFI_IDLE_CHECK_BOOTS (about
+  //     daily), purely as a safety net in case a hotspot is left on
+  //     without anyone pressing reset.
   //
-  //  wifiFailStreak survives deep sleep and still guards the open-network
-  //  fallback, so a permanently visible captive portal cannot burn radio
-  //  time forever.
+  //  When we do look, we scan first (about 2.5 s) and only spend real
+  //  connect time on a network the scan actually saw. The old code
+  //  blind-dialled the saved SSID for a full 15 s even in an empty field,
+  //  so each check is now roughly six times cheaper than it used to be.
   // ============================================================
   bool internetReady  = false;
-  bool attemptWifi    = true;
+  bool attemptWifi    = false;
   bootsSinceSync++;
+  bootsSinceAttempt++;
 
-  // V8-5: a genuine power-on or reset-button press means someone is
-  // standing at the device, so it is worth noting in the log. Brownout,
-  // panic and watchdog resets are failures, not a farmer with a hotspot.
+  // V8-5: only a genuine power-on or reset-button press counts as the
+  // farmer's sync command. A brownout, panic or watchdog reset must not
+  // masquerade as one, or a device with a weak battery would sit there
+  // retrying WiFi and draining itself further.
   esp_reset_reason_t rr = esp_reset_reason();
   bool physicalReset = (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) &&
                        (rr == ESP_RST_POWERON || rr == ESP_RST_EXT || rr == ESP_RST_SW);
   if (rr == ESP_RST_BROWNOUT || rr == ESP_RST_PANIC || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT) {
-    wifiFailStreak++;
-    log_msg("[WiFi] Abnormal reset (" + String((int)rr) + ") — counted as a failed attempt.");
-  }
-  if (physicalReset) {
-    wifiFailStreak = 0;   // someone is here; give the open-network path a clean slate
-    log_msg("[WiFi] Physical reset — fail streak cleared.");
+    log_msg("[WiFi] Abnormal reset (" + String((int)rr) + ") — not treated as a sync request.");
   }
 
   float lfsNow = lfsUsageFraction();
-  if (lfsNow >= 0.60f) {
-    log_msg("[WiFi] Buffer at " + String(lfsNow * 100.0f, 0) + "% — sync is getting urgent.");
-  }
-  log_msg("[WiFi] " + String(bootsSinceSync) + " boot(s) since the last successful sync.");
+  bool  lfsUrgent = (lfsNow >= 0.60f);
 
-  bootsSinceAttempt++;
+  if (physicalReset) {
+    attemptWifi = true;
+    wifiFailStreak = 0;      // someone is standing here; start clean
+    log_msg("[WiFi] Reset button / power-on — this is a sync request. Trying WiFi.");
+  } else if (lfsUrgent && bootsSinceAttempt >= WIFI_URGENT_CHECK_BOOTS) {
+    attemptWifi = true;
+    log_msg("[WiFi] Buffer at " + String(lfsNow * 100.0f, 0) + "% — checking for a network.");
+  } else if (bootsSinceAttempt >= WIFI_IDLE_CHECK_BOOTS) {
+    attemptWifi = true;
+    log_msg("[WiFi] Routine check (" + String(bootsSinceAttempt) + " boots since the last one).");
+  } else {
+    log_msg("[WiFi] Skipped — no network expected on a timer wake. " +
+            String(bootsSinceSync) + " reading(s) buffered since the last sync.");
+  }
+
   if (attemptWifi) {
     bootsSinceAttempt = 0;
     // ── helper: clean radio reset ──
