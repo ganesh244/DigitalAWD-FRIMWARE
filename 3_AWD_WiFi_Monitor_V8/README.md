@@ -48,20 +48,29 @@ deliberate, human-triggered sync:
    network, uploads everything it has buffered, corrects its clock, and
    goes back to sleep.
 
-In practice this happens every month or two, or after a harvest. Hold
-the hotspot open until the serial log or the sheet shows the upload
-finished. Two months of hourly readings is roughly 1400 records, which
-upload in about three minutes.
+In practice this happens every month or two, or after a harvest.
 
-Timer wakes do not normally touch the radio, because there is nothing
-to find and ~1400 pointless scans between visits would waste battery.
-Two safety nets exist: a routine look about once a day, and a more
-frequent one if the flash buffer ever passes 60 % full.
+**The order does not matter and the timing is forgiving.** After a reset
+the device keeps looking for about two minutes, scanning every fifteen
+seconds, so the hotspot can be switched on after the button is pressed.
+Leave it on until the upload finishes. Two months of hourly readings is
+roughly 1400 records and takes about three minutes to upload, so allow
+five minutes in total to be safe.
 
-Reset detection deliberately ignores brownout, panic and watchdog
-resets. Only a real power-on or reset-button press counts, so a device
-with a weak battery cannot fall into a loop of resetting and retrying
-WiFi.
+Timer wakes do not normally touch the radio, because there is nothing to
+find and ~1400 pointless scans between visits would waste battery. Two
+safety nets exist: a routine look about once a day, and a more frequent
+one if the flash buffer ever passes 60 % full.
+
+**Reset detection is deliberately generous.** Any boot that is not the
+ordinary deep-sleep timer wake is taken as a sync request, whatever
+reset code the board reports. Missing a sync is far more costly than an
+unnecessary radio check: somebody has travelled to the field, and if the
+device ignores them they leave believing the data went up. The one
+exception is a repeated fault reset (brownout, panic or watchdog). The
+first couple still count, because a tired battery can brown out just as
+the radio starts, but a continuing loop stops being treated as a
+request so the device cannot drain itself.
 
 ## Record format
 

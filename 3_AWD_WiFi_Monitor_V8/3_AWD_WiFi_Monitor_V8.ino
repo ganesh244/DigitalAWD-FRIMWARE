@@ -57,6 +57,19 @@
 //   V8-18 Upload batch 10 -> 40 records. A month or two of hourly readings
 //         is 700-1400 records; at 10 per upload the farmer had to hold the
 //         hotspot open for the best part of ten minutes.
+//   V8-19 Reset detection made fail-safe. Any boot that is not the ordinary
+//         deep-sleep timer wake now counts as a sync request, instead of
+//         having to match a list of reset codes. Boards differ in what they
+//         report for a button press, and an unrecognised code must never
+//         silently disable the only sync path the device has. A fault reset
+//         (brownout, panic, watchdog) still counts for the first couple of
+//         occurrences, because a tired battery can brown out exactly when
+//         the radio starts, and only stops counting once it is clearly a
+//         loop.
+//   V8-20 A sync request retries for a couple of minutes instead of giving
+//         up after one pass. The farmer may press the button before
+//         switching the hotspot on, or the phone may take a few seconds to
+//         bring it up. Routine timer checks still make a single pass.
 // ============================================================
 #define PORTAL_TIMEOUT_MS   600000UL
 
@@ -175,6 +188,15 @@ RTC_DATA_ATTR uint32_t deepSleepSeconds  = NORMAL_SLEEP_SECONDS;
 // cycles (one hour each by default).
 #define WIFI_IDLE_CHECK_BOOTS    24   // routine look, about once a day
 #define WIFI_URGENT_CHECK_BOOTS   6   // when the flash buffer is filling up
+// A reset is the farmer asking to sync, so the device keeps looking for a
+// few minutes rather than giving up after one pass: the hotspot may be
+// switched on a moment after the button, or take time to come up.
+#define SYNC_REQUEST_PASSES       6   // acquisition passes after a reset
+#define SYNC_REQUEST_GAP_MS   15000   // wait between them
+// Brownouts can be caused by the radio switching on with a tired battery,
+// and the farmer's own reset can trigger one. Allow this many before we
+// stop treating a fault reset as a possible sync request.
+#define FAULT_RESET_GRACE         2
 // After this many consecutive failures the device stops retrying unknown
 // OPEN networks, so a captive portal near the field cannot drain it. The
 // saved hotspot is always still tried.
@@ -182,6 +204,7 @@ RTC_DATA_ATTR uint32_t deepSleepSeconds  = NORMAL_SLEEP_SECONDS;
 RTC_DATA_ATTR uint32_t wifiFailStreak    = 0;   // consecutive offline boots
 RTC_DATA_ATTR uint32_t bootsSinceSync    = 0;   // boots since last successful sync
 RTC_DATA_ATTR uint32_t bootsSinceAttempt = 0;   // boots since last WiFi attempt
+RTC_DATA_ATTR uint32_t faultResetStreak  = 0;   // consecutive brownout/panic/WDT resets
 RTC_DATA_ATTR uint32_t lastNtpDay        = 0;   // V8-14: day number of the last NTP sync
 String deviceId = "";                            // V8-13
 
@@ -1142,15 +1165,42 @@ void setup() {
   bootsSinceSync++;
   bootsSinceAttempt++;
 
-  // V8-5: only a genuine power-on or reset-button press counts as the
-  // farmer's sync command. A brownout, panic or watchdog reset must not
-  // masquerade as one, or a device with a weak battery would sit there
-  // retrying WiFi and draining itself further.
+  // ── Is this the farmer asking for a sync? ──────────────────────────
+  // V8-19: this decision is fail-safe by design. Missing a sync request
+  // is far worse than an unnecessary one: somebody has travelled to the
+  // field, switched on a hotspot and pressed the button, and if we ignore
+  // that they leave believing the data is uploaded when it is not, and
+  // nobody finds out for another month or two. An unnecessary attempt
+  // only costs a few seconds of radio.
+  //
+  // So the rule is inverted from the obvious one. Rather than listing the
+  // reset codes that count as a button press, we assume ANY boot that is
+  // not the ordinary deep-sleep timer wake IS a sync request, unless it
+  // is clearly a fault. Different ESP32 boards report a button press
+  // differently (POWERON on most, EXT on some), and an unrecognised code
+  // must not silently disable the only sync path this device has.
   esp_reset_reason_t rr = esp_reset_reason();
-  bool physicalReset = (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) &&
-                       (rr == ESP_RST_POWERON || rr == ESP_RST_EXT || rr == ESP_RST_SW);
-  if (rr == ESP_RST_BROWNOUT || rr == ESP_RST_PANIC || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT) {
-    log_msg("[WiFi] Abnormal reset (" + String((int)rr) + ") — not treated as a sync request.");
+  bool timerWake = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) || (rr == ESP_RST_DEEPSLEEP);
+  bool faultReset = (rr == ESP_RST_BROWNOUT || rr == ESP_RST_PANIC ||
+                     rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT);
+
+  // A tired battery can brown out exactly when the radio switches on, and
+  // the farmer's own reset can be the thing that triggers it. So do not
+  // dismiss a fault reset outright: allow the first couple to still try,
+  // and only start ignoring them once it is plainly a loop.
+  if (faultReset) faultResetStreak++;
+  else            faultResetStreak = 0;
+
+  bool physicalReset = !timerWake &&
+                       (!faultReset || faultResetStreak <= FAULT_RESET_GRACE);
+
+  if (!timerWake) {
+    log_msg("[WiFi] Boot was not a timer wake (reset reason " + String((int)rr) + ").");
+    if (faultReset) {
+      log_msg("[WiFi] That reset looks like a fault, streak=" + String(faultResetStreak) +
+              (physicalReset ? " — trying anyway in case it was the reset button."
+                             : " — repeated, so not treating it as a sync request."));
+    }
   }
 
   float lfsNow = lfsUsageFraction();
@@ -1217,67 +1267,85 @@ void setup() {
       return false;
     };
 
-    wifiReset();
+    // ── one acquisition pass: scan, then connect to what the scan saw ──
+    auto acquireOnce = [&]() -> bool {
+      wifiReset();
+      log_msg("[WiFi] Scanning...");
+      delay(150);
+      wdt_feed();
 
-    // ── V8-17 step 1: one scan, then decide ──────────────────────────
-    log_msg("[WiFi] Scanning...");
-    delay(150);
-    wdt_feed();
+      struct OpenNet { String ssid; int rssi; };
+      std::vector<OpenNet> openNets;
+      bool savedInRange = false;
+      int  savedRssi    = 0;
 
-    struct OpenNet { String ssid; int rssi; };
-    std::vector<OpenNet> openNets;
-    bool savedInRange = false;
-    int  savedRssi    = 0;
-
-    int n = WiFi.scanNetworks(false, false);
-    wdt_feed();
-    if (n > 0) {
-      log_msg("[WiFi] Found " + String(n) + " network(s):");
-      for (int i = 0; i < n; i++) {
-        String s    = WiFi.SSID(i);
-        int    rssi = WiFi.RSSI(i);
-        bool   open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
-        log_msg("  \"" + s + "\" RSSI=" + String(rssi) +
-                (open ? " OPEN" : " secured"));
-        if (s.length() > 0 && s == ssid_config) { savedInRange = true; savedRssi = rssi; }
-        if (open && s.length() > 0) openNets.push_back({s, rssi});
-      }
-    } else {
-      log_msg("[WiFi] Nothing on the air.");
-    }
-    WiFi.scanDelete();
-
-    // ── step 2: the saved hotspot, but only when it is actually there ──
-    if (savedInRange) {
-      log_msg("[WiFi] Saved network in range (RSSI " + String(savedRssi) + ").");
-      internetReady = tryConnect(ssid_config, pass_config, 15000);
-    } else if (ssid_config.length() > 0) {
-      log_msg("[WiFi] Saved network \"" + ssid_config + "\" not in range.");
-    }
-
-    // ── step 3: fall back to open networks ──
-    // Guarded by the fail streak so a permanent captive portal nearby cannot
-    // burn 30 s of radio on every single boot forever.
-    if (!internetReady && !openNets.empty()) {
-      if (wifiFailStreak >= WIFI_OPEN_SKIP_AFTER_FAILURES) {
-        log_msg("[WiFi] " + String(openNets.size()) + " open network(s) present, but " +
-                String(wifiFailStreak) + " failures in a row — skipping them this boot.");
+      int n = WiFi.scanNetworks(false, false);
+      wdt_feed();
+      if (n > 0) {
+        log_msg("[WiFi] Found " + String(n) + " network(s):");
+        for (int i = 0; i < n; i++) {
+          String s    = WiFi.SSID(i);
+          int    rssi = WiFi.RSSI(i);
+          bool   open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+          log_msg("  \"" + s + "\" RSSI=" + String(rssi) +
+                  (open ? " OPEN" : " secured"));
+          if (s.length() > 0 && s == ssid_config) { savedInRange = true; savedRssi = rssi; }
+          if (open && s.length() > 0) openNets.push_back({s, rssi});
+        }
       } else {
-        std::sort(openNets.begin(), openNets.end(),
-          [](const OpenNet& a, const OpenNet& b){ return a.rssi > b.rssi; });
-        int tried = 0;
-        for (auto& net : openNets) {
-          if (internetReady || tried >= 2) break;    // strongest two only
-          internetReady = tryConnect(net.ssid, "", 10000);
-          tried++;
+        log_msg("[WiFi] Nothing on the air.");
+      }
+      WiFi.scanDelete();
+
+      // the saved hotspot, but only when it is actually there
+      if (savedInRange) {
+        log_msg("[WiFi] Saved network in range (RSSI " + String(savedRssi) + ").");
+        if (tryConnect(ssid_config, pass_config, 15000)) return true;
+      } else if (ssid_config.length() > 0) {
+        log_msg("[WiFi] Saved network \"" + ssid_config + "\" not in range.");
+      }
+
+      // fall back to open networks. Guarded by the fail streak so a
+      // permanent captive portal nearby cannot burn radio on every boot.
+      if (!openNets.empty()) {
+        if (wifiFailStreak >= WIFI_OPEN_SKIP_AFTER_FAILURES) {
+          log_msg("[WiFi] " + String(openNets.size()) + " open network(s) present, but " +
+                  String(wifiFailStreak) + " failures in a row — skipping them.");
+        } else {
+          std::sort(openNets.begin(), openNets.end(),
+            [](const OpenNet& a, const OpenNet& b){ return a.rssi > b.rssi; });
+          int tried = 0;
+          for (auto& net : openNets) {
+            if (tried >= 2) break;    // strongest two only
+            if (tryConnect(net.ssid, "", 10000)) return true;
+            tried++;
+          }
         }
       }
+      return false;
+    };
+
+    // ── V8-20: keep trying while the farmer is standing there ──────────
+    // A reset means somebody has come to the field to sync. They may press
+    // the button before switching the hotspot on, or the phone may take a
+    // few seconds to bring it up, so one pass is not enough. Retry for a
+    // couple of minutes. A routine timer check makes a single pass, since
+    // nobody is waiting and there is nothing to find.
+    int passes = physicalReset ? SYNC_REQUEST_PASSES : 1;
+    for (int pass = 0; pass < passes && !internetReady; pass++) {
+      if (pass > 0) {
+        log_msg("[WiFi] No network yet (pass " + String(pass) + " of " + String(passes) +
+                "). Waiting " + String(SYNC_REQUEST_GAP_MS / 1000) +
+                " s — switch the hotspot on now if it is not already.");
+        unsigned long waitStart = millis();
+        while (millis() - waitStart < SYNC_REQUEST_GAP_MS) { wdt_feed(); delay(250); }
+      }
+      internetReady = acquireOnce();
     }
 
     // ── Outcome ──
-    // The streak only gates the open-network fallback (see step 3). The
-    // scan and the saved-network connect always run, so the device can
-    // never miss a hotspot window no matter how long it has been offline.
+    // The streak only gates the open-network fallback. The scan and the
+    // saved-network connect always run when we look at all.
     if (internetReady) {
       wifiFailStreak = 0;
       bootsSinceSync = 0;

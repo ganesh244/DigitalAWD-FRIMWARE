@@ -265,6 +265,18 @@
             is 700-1400 buffered rows, which at 10 per upload meant up to
             144 TLS round trips and close to ten minutes of the farmer
             holding the hotspot open. At 40 it is about three minutes.
+      V8-19 Reset detection made fail-safe. Any boot that is not the ordinary
+            deep-sleep timer wake now counts as a sync request, rather than
+            having to match a list of reset codes: boards differ in what they
+            report for a button press, and an unrecognised code must never
+            silently disable the only sync path the device has. Repeated
+            fault resets (brownout, panic, watchdog) still stop counting, but
+            only after the first couple, since a tired battery can brown out
+            exactly when the radio starts.
+      V8-20 A sync request now retries for about two minutes instead of
+            giving up after a single pass, so the hotspot can be switched on
+            after the reset button is pressed. Routine timer checks still
+            make one pass.
       Note: 95 % of the 1.2 MB app partition. Use "Minimal SPIFFS" partition
       if you add more code, or drop TelnetStream (never started anyway).
     
