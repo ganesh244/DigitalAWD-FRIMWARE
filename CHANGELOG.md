@@ -238,7 +238,15 @@
       V8-11 Config portal exits after 10 minutes.
       V8-12 Sleep 10..86400 s and pipe height 5..300 cm clamped.
       V8-13 "Flooding" → "Flood Alert"; median needs ≥3 pings; deviceId field.
-      Note: 96 % of the 1.2 MB app partition. Use "Minimal SPIFFS" partition
+      V8-14 NTP only when the clock is invalid or on the first upload of the
+            day. A field log from 2026-09-09 showed an iPhone hotspot blocking
+            NTP while the DS3231 held correct time, so the old unconditional
+            10 s wait spent radio power on every boot for a sync that could
+            not succeed, then wrongly logged the timestamps as invalid.
+      V8-15 Watchdog 30 s → 60 s. With the TLS timeouts now bounded, one
+            connect + handshake can block 20 s without feeding the watchdog,
+            which left too little margin before a panic reset mid-upload.
+      Note: 94 % of the 1.2 MB app partition. Use "Minimal SPIFFS" partition
       if you add more code, or drop TelnetStream (never started anyway).
     
     Apps Script for the GSM and WiFi devices: not changed. Both now send

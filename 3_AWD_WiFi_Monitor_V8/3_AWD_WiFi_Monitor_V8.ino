@@ -37,6 +37,13 @@
 //         longer become a 136-year sleep.
 //   V8-13 Status "Flooding" → "Flood Alert" (fleet standard); median
 //         needs ≥3 valid pings; "deviceId" (efuse MAC tail) in every record.
+//   V8-14 NTP runs only when the clock is invalid or it is the first upload
+//         of the day. Field logs show phone hotspots blocking UDP 123, so
+//         the old unconditional 10 s wait burned radio time every boot for
+//         a sync that could not succeed, and then wrongly reported the
+//         timestamps as invalid while the DS3231 was keeping good time.
+//   V8-15 Watchdog 30 s → 60 s: a bounded TLS connect+handshake can block
+//         20 s without feeding it, which left too little margin.
 // ============================================================
 #define PORTAL_TIMEOUT_MS   600000UL
 
@@ -67,7 +74,12 @@
 // ============================================================
 //  WATCHDOG
 // ============================================================
-#define WDT_TIMEOUT_S 30
+// V8-15: 30 s was too tight once the TLS timeouts were bounded — a single
+// client.connect() can block for up to 10 s (connect) + 10 s (handshake)
+// with no chance to feed the watchdog, leaving only 10 s of margin before a
+// panic reset mid-upload. 60 s still catches a genuine hang; the device
+// deep-sleeps between readings, so a longer ceiling costs nothing.
+#define WDT_TIMEOUT_S 60
 
 // ============================================================
 //  SMART SLEEP
@@ -159,6 +171,7 @@ RTC_DATA_ATTR uint32_t wifiFailStreak    = 0;   // consecutive failed boots
 RTC_DATA_ATTR uint32_t wifiSkipRemaining = 0;   // boots left to skip
 RTC_DATA_ATTR uint32_t bootsSinceSync    = 0;   // boots since last successful sync
 RTC_DATA_ATTR uint32_t bootsSinceAttempt = 0;   // V8-4: boots since last WiFi attempt
+RTC_DATA_ATTR uint32_t lastNtpDay        = 0;   // V8-14: day number of the last NTP sync
 String deviceId = "";                            // V8-13
 
 // ============================================================
@@ -1190,36 +1203,54 @@ void setup() {
   if (internetReady) {
 
     // ── NTP time sync ──
-    // Use multiple servers for reliability — mobile hotspots sometimes
-    // block pool.ntp.org. Falls back to time.google.com and time.cloudflare.com.
-    // FIX: previous code used a single 5 s getLocalTime() call.
-    // NTP is UDP — the first packet is often dropped on mobile hotspots.
-    // Now retries up to 10 s with 500 ms polling so we don't miss it.
-    configTime(19800, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
-    log_msg("[NTP] Waiting for time sync...");
-    {
-      struct tm ti;
-      unsigned long ntpStart = millis();
-      while (millis() - ntpStart < 10000) {
-        wdt_feed();
-        if (getLocalTime(&ti, 500) && ti.tm_year > 120) {  // year > 2020
-          ntpReady = true;
-          break;
+    // V8-14: only sync when it is actually needed. A healthy DS3231 drifts
+    // about a minute a year, so one resync per day is ample. Field logs show
+    // iPhone/Android hotspots blocking NTP's UDP port 123 outright, which
+    // made the old code burn a full 10 s of radio time (~120 mA) on EVERY
+    // online boot for a sync that could never succeed, then print
+    // "timestamps will be invalid" while the RTC was keeping perfect time.
+    uint32_t todayNum = 0;
+    bool needNtp = !clockValid();          // no usable clock at all → must try
+    if (rtcReady && clockValid()) {
+      todayNum = (uint32_t)(rtc.now().unixtime() / 86400UL);
+      if (todayNum != lastNtpDay) needNtp = true;   // first upload of the day
+    }
+
+    if (needNtp) {
+      // Multiple servers: some hotspots block one but not the others.
+      configTime(19800, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+      log_msg("[NTP] Waiting for time sync...");
+      {
+        struct tm ti;
+        unsigned long ntpStart = millis();
+        while (millis() - ntpStart < 10000) {
+          wdt_feed();
+          if (getLocalTime(&ti, 500) && ti.tm_year > 120) {  // year > 2020
+            ntpReady = true;
+            break;
+          }
         }
       }
-    }
-    if (ntpReady) {
-      log_msg("[NTP] Time synced: " + getTimestamp());
-      // Also update hardware RTC if present
-      if (rtcReady) {
-        struct tm ti;
-        getLocalTime(&ti, 100);
-        rtc.adjust(DateTime(ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
-                            ti.tm_hour, ti.tm_min, ti.tm_sec));
-        log_msg("[NTP] Hardware RTC updated.");
+      if (ntpReady) {
+        log_msg("[NTP] Time synced: " + getTimestamp());
+        // Also update hardware RTC if present
+        if (rtcReady) {
+          struct tm ti;
+          getLocalTime(&ti, 100);
+          rtc.adjust(DateTime(ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                              ti.tm_hour, ti.tm_min, ti.tm_sec));
+          lastNtpDay = (uint32_t)(rtc.now().unixtime() / 86400UL);
+          log_msg("[NTP] Hardware RTC updated.");
+        }
+      } else if (clockValid()) {
+        // Not a problem: the DS3231 is the primary clock, NTP is only a
+        // correction. Common on phone hotspots, which block UDP 123.
+        log_msg("[NTP] Unavailable (hotspot blocks it?) — using DS3231 time.");
+      } else {
+        log_msg("[NTP] Sync failed and no valid RTC — records marked clockValid:false.");
       }
     } else {
-      log_msg("[NTP] Sync failed — timestamps will be invalid this boot.");
+      log_msg("[NTP] Skipped — DS3231 valid, already synced today.");
     }
 
     // FIX: always flush stored data on every wake — original code skipped

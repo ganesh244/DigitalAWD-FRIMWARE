@@ -30,7 +30,8 @@ only used as overflow when LittleFS is 75 % full.
 4. WiFi: saved SSID for 15 s (gives up early when the SSID is absent),
    else one scan and the two strongest open networks for 10 s each,
    each checked with a connectivity probe.
-5. Online: NTP (10 s), then `syncAllToSheets()` posts `/data.txt` and
+5. Online: NTP only if the clock is invalid or this is the first upload
+   of the day, then `syncAllToSheets()` posts `/data.txt` and
    the SD backup in batches of 10 through the raw TLS client that
    follows the Apps Script 302 redirect. Failed batches are kept.
 6. Deep sleep for the configured interval, or 60 s when the level moved
@@ -65,7 +66,7 @@ Short GPIO15 to GND, reset. Join **wifi - AWD PIPE** (password
 ## Flashing
 
 Board ESP32 Dev Module, partition Default 4MB with spiffs, ArduinoJson
-7, NewPing, RTClib, TelnetStream. The sketch uses 96 % of the app
+7, NewPing, RTClib, TelnetStream. The sketch uses 94 % of the app
 partition; if a future change no longer fits, remove TelnetStream (it
 is never started) or switch to the Minimal SPIFFS partition.
 
@@ -76,10 +77,25 @@ Expect on serial:
 [Sensor] Distance=43cm  Level=12.0cm  Status=Good
 [SAVE] Stored in LittleFS. Usage now 0.3%
 [WiFi] Internet OK via: MyHotspot
-[NTP] Time synced: 2026-09-07 14:05:20
+[NTP] Skipped — DS3231 valid, already synced today.
 [FLUSH-LFS] OK (1/1)
 [Sleep] Going to sleep for 600s. Bye.
 ```
+
+## Time keeping
+
+The DS3231 is the primary clock. NTP is only a correction and runs once
+per day, or whenever the RTC has no valid time. Phone hotspots commonly
+block NTP's UDP port 123, so a line like
+
+```
+[NTP] Unavailable (hotspot blocks it?) — using DS3231 time.
+```
+
+is normal and harmless: the reading is still stamped from the RTC. Only
+`[NTP] Sync failed and no valid RTC` means the timestamp is missing, and
+then the record carries `clockValid:false` so the Apps Script can fall
+back to its own receive time.
 
 ## Troubleshooting
 
