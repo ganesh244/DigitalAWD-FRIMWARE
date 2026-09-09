@@ -277,6 +277,16 @@
             giving up after a single pass, so the hotspot can be switched on
             after the reset button is pressed. Routine timer checks still
             make one pass.
+      V8-21 A sonar echo landing more than 8 cm past the bottom of the pipe
+            is now a SensorError instead of being clamped to "Low, 0 cm".
+            The 2026-09-09 bench log read 58 cm against a 55 cm pipe and
+            called it dry; in the field that same reading can mean the head
+            has slipped or the pipe has been pulled out, and a false "dry"
+            tells a farmer to irrigate a field that may be flooded. The raw
+            distance is included in the record so the cause is visible.
+      V8-22 The HTTP-Date clock check reports once per boot even when no
+            correction was needed, so it can be verified before the day the
+            RTC is actually wrong.
       Note: 95 % of the 1.2 MB app partition. Use "Minimal SPIFFS" partition
       if you add more code, or drop TelnetStream (never started anyway).
     

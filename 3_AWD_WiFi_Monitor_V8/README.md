@@ -79,9 +79,20 @@ request so the device cannot drain itself.
  "network":"pending","wifiStrength":0,"lfsUsedPct":3,
  "waterLevel":12.0,"status":"Good","dataType":"Current"}
 ```
-Stored records are re-labelled `Backup` when uploaded later. A failed
-reading (fewer than 3 valid echoes) is stored as
-`"dataType":"SensorError","status":"SensorFailure","waterLevel":null`.
+Stored records are re-labelled `Backup` when uploaded later.
+
+A reading is stored as
+`"dataType":"SensorError","status":"SensorFailure","waterLevel":null`
+in two cases:
+
+- fewer than 3 of the 5 pings came back
+- the echo landed more than 8 cm beyond the bottom of the pipe, which
+  means the sensor head has moved or the ping missed the pipe. The
+  record then also carries `rawDistance` so the cause is visible.
+
+The second case matters because the alternative is reporting a confident
+`Low, 0 cm`, and `Low` is what tells a farmer to irrigate. A slipped
+sensor must never be able to trigger irrigation of a flooded field.
 
 ## Config portal
 

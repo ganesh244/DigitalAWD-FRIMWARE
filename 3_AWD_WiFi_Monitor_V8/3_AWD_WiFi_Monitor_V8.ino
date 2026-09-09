@@ -70,6 +70,16 @@
 //         up after one pass. The farmer may press the button before
 //         switching the hotspot on, or the phone may take a few seconds to
 //         bring it up. Routine timer checks still make a single pass.
+//   V8-21 An echo landing more than SENSOR_BEYOND_PIPE_CM past the bottom of
+//         the pipe is reported as SensorError instead of being clamped to
+//         "Low, 0 cm". Bench log of 2026-09-09 read 58 cm against a 55 cm
+//         pipe and called it a dry pipe; in the field the same reading can
+//         mean the sensor head has slipped or the pipe has been pulled out,
+//         and telling a farmer to irrigate a possibly flooded field is the
+//         worst way to be wrong. The raw distance goes into the record.
+//   V8-22 The HTTP-Date clock check now says so once per boot even when the
+//         RTC needed no correction, so the mechanism can be verified before
+//         it is ever actually needed.
 // ============================================================
 #define PORTAL_TIMEOUT_MS   600000UL
 
@@ -114,6 +124,11 @@
 #define NORMAL_SLEEP_SECONDS            600    // 10 min default
 #define SHORT_SLEEP_SECONDS              60    // 1 min on rapid water change
 #define WATER_LEVEL_CHANGE_THRESHOLD_CM 5.0f
+// V8-21: how far past the pipe bottom an echo may land before we stop
+// believing it. The sensor head sits a little above the pipe mouth, so a
+// small overshoot is normal on an empty pipe; a large one means the
+// hardware has moved or the ping missed the pipe altogether.
+#define SENSOR_BEYOND_PIPE_CM           8.0f
 
 // ============================================================
 //  LITTLEFS SPILL THRESHOLDS
@@ -457,6 +472,8 @@ int countLinesSd(const char* path) {
 // ============================================================
 #define TZ_OFFSET_SECONDS 19800   // IST, UTC+5:30
 
+static bool httpDateReported = false;   // log the clock check once per boot
+
 void applyHttpDate(String v) {
   v.trim();
   // RFC 7231 preferred form: "Tue, 09 Sep 2026 07:50:33 GMT"
@@ -495,10 +512,17 @@ void applyHttpDate(String v) {
       lastNtpDay = (uint32_t)(local.unixtime() / 86400UL);
       log_msg("[CLOCK] Corrected from HTTP Date header (was off by " +
               String(drift) + " s).");
+    } else if (!httpDateReported) {
+      // Say so once per boot even when nothing needed changing. Otherwise
+      // there is no way to tell this clock source works until the day the
+      // RTC is actually wrong, which is exactly the wrong time to find out.
+      log_msg("[CLOCK] HTTP Date header agrees with the DS3231 (" +
+              String(drift) + " s apart) — no correction needed.");
     }
-  } else {
+  } else if (!httpDateReported) {
     log_msg("[CLOCK] Set from HTTP Date header (no DS3231 fitted).");
   }
+  httpDateReported = true;
 }
 
 // ============================================================
@@ -1117,6 +1141,20 @@ void setup() {
       doc["dataType"]   = "SensorError";
       doc["status"]     = "SensorFailure";
       doc["waterLevel"] = nullptr;
+    } else if ((float)distanceCm > pipeHeightCm + SENSOR_BEYOND_PIPE_CM) {
+      // V8-21: the echo came back from further away than the bottom of the
+      // pipe can possibly be. That is not a dry pipe, it is a mounting or
+      // sensor problem: the head has slipped, the pipe has been pulled out,
+      // or the ping is bouncing off the ground beyond it. Reporting that as
+      // "Low, 0 cm" would tell the farmer to irrigate a field that might
+      // actually be flooded, so it is called what it is.
+      log_msg("[Sensor] Distance=" + String(distanceCm) + "cm exceeds pipe height " +
+              String(pipeHeightCm, 0) + "cm by more than " + String(SENSOR_BEYOND_PIPE_CM, 0) +
+              "cm — SensorError, not a dry pipe.");
+      doc["dataType"]    = "SensorError";
+      doc["status"]      = "SensorFailure";
+      doc["waterLevel"]  = nullptr;
+      doc["rawDistance"] = distanceCm;   // so the cause is visible in the sheet
     } else {
       waterLevelCm = constrain((float)pipeHeightCm - (float)distanceCm, 0.0f, pipeHeightCm);
       log_msg("[Sensor] Distance=" + String(distanceCm) + "cm  Level=" +
