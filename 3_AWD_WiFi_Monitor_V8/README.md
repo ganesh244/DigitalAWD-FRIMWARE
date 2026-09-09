@@ -50,12 +50,18 @@ deliberate, human-triggered sync:
 
 In practice this happens every month or two, or after a harvest.
 
-**The order does not matter and the timing is forgiving.** After a reset
-the device keeps looking for about two minutes, scanning every fifteen
-seconds, so the hotspot can be switched on after the button is pressed.
-Leave it on until the upload finishes. Two months of hourly readings is
-roughly 1400 records and takes about three minutes to upload, so allow
-five minutes in total to be safe.
+**Switch the hotspot on first, then press reset.** The device makes one
+attempt, so the network has to be broadcasting at that moment. If a sync
+is missed, raise `SYNC_REQUEST_PASSES` in the sketch to 3 or 4 and it
+will keep looking for a minute instead.
+
+On an iPhone, open the Personal Hotspot settings screen and leave it
+open while syncing. iOS stops broadcasting the hotspot after a while
+when nothing is connected to it, and only resumes while that screen is
+showing. This is the most likely cause of a missed sync.
+
+Leave the hotspot on until the upload finishes. Two months of hourly
+readings is roughly 1400 records and takes about three minutes.
 
 Timer wakes do not normally touch the radio, because there is nothing to
 find and ~1400 pointless scans between visits would waste battery. Two

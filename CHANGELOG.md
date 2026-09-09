@@ -273,10 +273,11 @@
             fault resets (brownout, panic, watchdog) still stop counting, but
             only after the first couple, since a tired battery can brown out
             exactly when the radio starts.
-      V8-20 A sync request now retries for about two minutes instead of
-            giving up after a single pass, so the hotspot can be switched on
-            after the reset button is pressed. Routine timer checks still
-            make one pass.
+      V8-20 A reset-triggered sync makes SYNC_REQUEST_PASSES attempts,
+            currently 1: the hotspot must be broadcasting when the button is
+            pressed. Raise it if syncs are missed in the field; the usual
+            cause would be iOS suspending Personal Hotspot when nothing is
+            connected to it.
       V8-21 A sonar echo landing more than 8 cm past the bottom of the pipe
             is now a SensorError instead of being clamped to "Low, 0 cm".
             The 2026-09-09 bench log read 58 cm against a 55 cm pipe and

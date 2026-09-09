@@ -66,10 +66,9 @@
 //         occurrences, because a tired battery can brown out exactly when
 //         the radio starts, and only stops counting once it is clearly a
 //         loop.
-//   V8-20 A sync request retries for a couple of minutes instead of giving
-//         up after one pass. The farmer may press the button before
-//         switching the hotspot on, or the phone may take a few seconds to
-//         bring it up. Routine timer checks still make a single pass.
+//   V8-20 A reset-triggered sync can retry, controlled by
+//         SYNC_REQUEST_PASSES. Set to 1: the hotspot must be switched on
+//         before the reset button is pressed. Raise it if syncs get missed.
 //   V8-21 An echo landing more than SENSOR_BEYOND_PIPE_CM past the bottom of
 //         the pipe is reported as SensorError instead of being clamped to
 //         "Low, 0 cm". Bench log of 2026-09-09 read 58 cm against a 55 cm
@@ -209,11 +208,18 @@ RTC_DATA_ATTR uint32_t deepSleepSeconds  = NORMAL_SLEEP_SECONDS;
 // cycles (one hour each by default).
 #define WIFI_IDLE_CHECK_BOOTS    24   // routine look, about once a day
 #define WIFI_URGENT_CHECK_BOOTS   6   // when the flash buffer is filling up
-// A reset is the farmer asking to sync, so the device keeps looking for a
-// few minutes rather than giving up after one pass: the hotspot may be
-// switched on a moment after the button, or take time to come up.
-#define SYNC_REQUEST_PASSES       6   // acquisition passes after a reset
-#define SYNC_REQUEST_GAP_MS   15000   // wait between them
+// How many times a reset-triggered sync looks for the network before giving
+// up. 1 means the hotspot must already be broadcasting when the button is
+// pressed, which is the intended field procedure: switch the hotspot on
+// first, then press reset.
+//
+// Raise this to 3 or 4 if syncs are ever missed in the field. The usual
+// reason would be an iPhone: iOS stops broadcasting Personal Hotspot after
+// a while when nothing is connected to it, and only starts again when the
+// Personal Hotspot settings screen is open. Each extra pass costs about
+// 15 s of radio, and only on a reset, never on a timer wake.
+#define SYNC_REQUEST_PASSES       1
+#define SYNC_REQUEST_GAP_MS   15000   // wait between passes, if more than one
 // Brownouts can be caused by the radio switching on with a tired battery,
 // and the farmer's own reset can trigger one. Allow this many before we
 // stop treating a fault reset as a possible sync request.
