@@ -287,6 +287,11 @@
       V8-22 The HTTP-Date clock check reports once per boot even when no
             correction was needed, so it can be verified before the day the
             RTC is actually wrong.
+      V8-23 An open network that fails its internet check is not retried for
+            the rest of that boot. A bench log showed the same dead open AP
+            being associated with on three consecutive retry passes, roughly
+            50 s of the two-minute sync window, while the farmer's hotspot
+            was still coming up.
       Note: 95 % of the 1.2 MB app partition. Use "Minimal SPIFFS" partition
       if you add more code, or drop TelnetStream (never started anyway).
     

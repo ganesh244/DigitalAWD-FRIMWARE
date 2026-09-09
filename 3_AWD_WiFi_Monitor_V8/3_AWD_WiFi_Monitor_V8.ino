@@ -80,6 +80,12 @@
 //   V8-22 The HTTP-Date clock check now says so once per boot even when the
 //         RTC needed no correction, so the mechanism can be verified before
 //         it is ever actually needed.
+//   V8-23 An open network that fails is not tried again for the rest of the
+//         boot. A bench log of 2026-09-09 showed the same dead open access
+//         point being associated with on three consecutive retry passes,
+//         about 50 s of the two-minute sync window spent on a network
+//         already known to have no internet, while the farmer's hotspot was
+//         still coming up.
 // ============================================================
 #define PORTAL_TIMEOUT_MS   600000UL
 
@@ -1305,6 +1311,18 @@ void setup() {
       return false;
     };
 
+    // V8-23: open networks that have already failed this boot. Retrying one
+    // costs 15-20 s of association and probe every pass, and a bench log
+    // showed the same dead open AP being tried on three passes in a row
+    // while the device was waiting for the farmer's hotspot to appear.
+    // Once an SSID has failed here it is not worth a second look until the
+    // next wake.
+    std::vector<String> deadOpen;
+    auto alreadyFailed = [&](const String& ssid) -> bool {
+      for (auto& d : deadOpen) if (d == ssid) return true;
+      return false;
+    };
+
     // ── one acquisition pass: scan, then connect to what the scan saw ──
     auto acquireOnce = [&]() -> bool {
       wifiReset();
@@ -1328,7 +1346,7 @@ void setup() {
           log_msg("  \"" + s + "\" RSSI=" + String(rssi) +
                   (open ? " OPEN" : " secured"));
           if (s.length() > 0 && s == ssid_config) { savedInRange = true; savedRssi = rssi; }
-          if (open && s.length() > 0) openNets.push_back({s, rssi});
+          if (open && s.length() > 0 && !alreadyFailed(s)) openNets.push_back({s, rssi});
         }
       } else {
         log_msg("[WiFi] Nothing on the air.");
@@ -1356,6 +1374,7 @@ void setup() {
           for (auto& net : openNets) {
             if (tried >= 2) break;    // strongest two only
             if (tryConnect(net.ssid, "", 10000)) return true;
+            deadOpen.push_back(net.ssid);   // V8-23: do not try it again this boot
             tried++;
           }
         }
