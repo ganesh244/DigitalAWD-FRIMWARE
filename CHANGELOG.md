@@ -246,7 +246,19 @@
       V8-15 Watchdog 30 s → 60 s. With the TLS timeouts now bounded, one
             connect + handshake can block 20 s without feeding the watchdog,
             which left too little margin before a panic reset mid-upload.
-      Note: 94 % of the 1.2 MB app partition. Use "Minimal SPIFFS" partition
+      V8-16 Clock is corrected from the HTTP "Date:" header of every upload.
+            The device reaches the internet through phone hotspots, which
+            block NTP's UDP port 123, so NTP alone could never fix a wrong
+            RTC in the field. The header is already being read, so this
+            costs no extra radio time and is accurate to a second or two.
+      V8-17 WiFi acquisition reworked: scan first (every wake, ~2.5 s), then
+            connect only to a network the scan actually saw. Removes the
+            old "skip WiFi for 5 boots after 3 failures" backoff, which made
+            the device deaf for five hours at a stretch and could miss the
+            short window when a farmer's hotspot is switched on. Also stops
+            blind-dialling the saved SSID for 15 s when it is not in range,
+            so the common no-network wake is now far cheaper than before.
+      Note: 95 % of the 1.2 MB app partition. Use "Minimal SPIFFS" partition
       if you add more code, or drop TelnetStream (never started anyway).
     
     Apps Script for the GSM and WiFi devices: not changed. Both now send

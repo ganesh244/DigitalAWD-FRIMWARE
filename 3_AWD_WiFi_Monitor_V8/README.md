@@ -24,15 +24,15 @@ only used as overflow when LittleFS is 75 % full.
 1. Mount LittleFS (format only after 3 failed mounts), RTC, SD. Merge
    any temp file left by a crash. Load config.
 2. **Read the sensor and append the record to `/data.txt`.**
-3. Decide whether to try WiFi. Backoff: after 3 failed attempts the
-   next 5 boots skip WiFi; an attempt is forced every 8 boots, when
-   LittleFS is over 60 % full, or after a real power-on/reset button.
-4. WiFi: saved SSID for 15 s (gives up early when the SSID is absent),
-   else one scan and the two strongest open networks for 10 s each,
-   each checked with a connectivity probe.
-5. Online: NTP only if the clock is invalid or this is the first upload
-   of the day, then `syncAllToSheets()` posts `/data.txt` and
-   the SD backup in batches of 10 through the raw TLS client that
+3. Scan for networks. This happens on **every** wake and takes about
+   2.5 s. There is no boot-skipping backoff, because the whole point is
+   to catch a hotspot during the short window it is switched on.
+4. Connect, but only to something the scan actually saw:
+   the saved SSID first (15 s), otherwise the two strongest open
+   networks (10 s each), each verified with a connectivity probe. If
+   neither is in range the radio goes straight back off.
+5. Online: correct the clock, then `syncAllToSheets()` posts `/data.txt`
+   and the SD backup in batches of 10 through the raw TLS client that
    follows the Apps Script 302 redirect. Failed batches are kept.
 6. Deep sleep for the configured interval, or 60 s when the level moved
    more than 5 cm since the last reading (smart sleep).
@@ -76,7 +76,10 @@ Expect on serial:
 [LFS] Ready. ...
 [Sensor] Distance=43cm  Level=12.0cm  Status=Good
 [SAVE] Stored in LittleFS. Usage now 0.3%
-[WiFi] Internet OK via: MyHotspot
+[WiFi] Found 2 network(s):
+  "iPhone" RSSI=-58 secured
+[WiFi] Saved network in range (RSSI -58).
+[WiFi] Internet OK via: iPhone
 [NTP] Skipped — DS3231 valid, already synced today.
 [FLUSH-LFS] OK (1/1)
 [Sleep] Going to sleep for 600s. Bye.
@@ -84,18 +87,33 @@ Expect on serial:
 
 ## Time keeping
 
-The DS3231 is the primary clock. NTP is only a correction and runs once
-per day, or whenever the RTC has no valid time. Phone hotspots commonly
-block NTP's UDP port 123, so a line like
+The DS3231 is the primary clock, and it is corrected from two sources.
+
+**The HTTP `Date:` header (main source).** Every response from Apps
+Script carries the current time in GMT, including the 302 redirect. The
+firmware parses it on each upload and adjusts the RTC whenever it is off
+by more than 30 seconds. This matters because the device normally
+reaches the internet through a phone hotspot, and hotspots block NTP's
+UDP port 123, so NTP can fail forever in the field. The header always
+arrives, costs no extra radio time, and is accurate to a second or two.
+
+```
+[CLOCK] Corrected from HTTP Date header (was off by 43 s).
+```
+
+**NTP (secondary).** Tried only when the clock is invalid or on the
+first upload of the day. When a hotspot blocks it you will see
 
 ```
 [NTP] Unavailable (hotspot blocks it?) — using DS3231 time.
 ```
 
-is normal and harmless: the reading is still stamped from the RTC. Only
-`[NTP] Sync failed and no valid RTC` means the timestamp is missing, and
-then the record carries `clockValid:false` so the Apps Script can fall
-back to its own receive time.
+which is harmless. The upload that follows will set the clock anyway.
+
+A record written before the clock was ever set carries
+`clockValid:false` and an empty timestamp, and the Apps Script falls
+back to its own receive time for that row. The device is self-healing:
+the first successful upload fixes the RTC for every reading afterwards.
 
 ## Troubleshooting
 
@@ -106,7 +124,8 @@ back to its own receive time.
   hotspot. Try another network; records stay in `/data.txt`.
 - Device stuck in AP mode: GPIO15 is a strapping pin. Remove the jumper
   and keep moisture off the header. V8 exits the portal after 10 min.
-- Battery drains fast: check the serial line `[WiFi] Skipping WiFi
-  (backoff)`. If WiFi runs every boot, the network is present but has
-  no internet; the connectivity probe then fails every time. Configure
-  a working SSID or move the device.
+- Battery drains fast: look at how long the radio stays on. A wake with
+  no network in range should show `[WiFi] Nothing on the air.` within
+  about 3 seconds. If instead you see repeated 10 s connect attempts to
+  open networks, a captive portal is nearby; after five failed boots the
+  firmware stops trying those on its own.

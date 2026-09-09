@@ -14,9 +14,8 @@
 //   V8-3  TLS client timeouts: setTimeout(15) was 15 ms on this core, so
 //         header reads could return empty and the redirect was missed
 //         (→ duplicate rows). Now 15000 ms + 10 s handshake + 10 s connect.
-//   V8-4  WiFi backoff: "force every 8 boots" used a counter that only
-//         reset on success, so after 8 failures WiFi was forced EVERY
-//         boot. Now counts boots since the last ATTEMPT.
+//   V8-4  WiFi backoff counter fixed (superseded by V8-17 below, which
+//         removes boot-skipping altogether).
 //   V8-5  Physical-reset detection = real power-on/reset only. Brownouts,
 //         panics and watchdog resets no longer count as "farmer pressed
 //         reset → force WiFi" (this was a battery-draining loop).
@@ -25,8 +24,7 @@
 //   V8-7  Temp-file swaps use rename() alone (LittleFS overwrites); a
 //         leftover temp file is merged back at boot instead of truncated.
 //   V8-8  WiFi time budget: stop waiting on WL_NO_SSID_AVAIL /
-//         WL_CONNECT_FAILED, one scan pass once networks are found, at
-//         most 2 open networks × 10 s.
+//         WL_CONNECT_FAILED; at most 2 open networks × 10 s.
 //   V8-9  RTC no longer set from compile time; a record without a valid
 //         clock carries clockValid:false and an empty timestamp.
 //   V8-10 LittleFS.begin(false); formats only after 3 consecutive mount
@@ -44,6 +42,16 @@
 //         timestamps as invalid while the DS3231 was keeping good time.
 //   V8-15 Watchdog 30 s → 60 s: a bounded TLS connect+handshake can block
 //         20 s without feeding it, which left too little margin.
+//   V8-16 The clock is now corrected from the HTTP "Date:" header returned
+//         by every upload. This device reaches the internet through phone
+//         hotspots, which block NTP, so NTP alone could never fix a wrong
+//         RTC in the field. The header costs nothing: it is already read.
+//   V8-17 WiFi acquisition reworked to scan first, then connect only to a
+//         network the scan actually saw, and to do this on EVERY wake.
+//         The old design blind-dialled the saved SSID for 15 s even when
+//         absent, and went deaf for five boots after three failures, which
+//         is how a farmer's short hotspot window gets missed. Scanning
+//         every boot costs about 2.5 s and is the cheaper behaviour.
 // ============================================================
 #define PORTAL_TIMEOUT_MS   600000UL
 
@@ -61,6 +69,7 @@
 #include <LittleFS.h>
 #include <TelnetStream.h>
 #include <Preferences.h>
+#include <sys/time.h>   // V8-16: settimeofday() for the HTTP-Date clock
 #include <esp_sleep.h>
 #include <esp_task_wdt.h>
 #include <rom/rtc.h>
@@ -150,27 +159,21 @@ RTC_DATA_ATTR float    lastWaterLevel    = -1.0f;
 static uint32_t bodSaved = 0;   // V8-6
 RTC_DATA_ATTR uint32_t deepSleepSeconds  = NORMAL_SLEEP_SECONDS;
 
-// ── WiFi Backoff ──
-// In field deployments WiFi is often unavailable for long periods.
-// Scanning + connecting attempts waste significant battery (150-180mA
-// for up to 60s per boot). These counters let us skip WiFi entirely
-// on most boots when it has been repeatedly unavailable.
+// ── WiFi state (survives deep sleep in RTC memory) ──
+// V8-17: there is no longer a "skip WiFi for N boots" backoff. This device
+// depends on catching a phone hotspot during a short, unpredictable window,
+// and going deaf for hours at a time is how those windows get missed. Every
+// wake now performs one cheap scan (~2.5 s) and only spends real connect
+// time on a network that scan actually saw.
 //
-// Strategy:
-//   - Every failed boot increments wifiFailStreak
-//   - Every successful boot resets it to 0
-//   - When streak >= WIFI_SKIP_AFTER_FAILURES, skip WiFi for
-//     WIFI_SKIP_BOOTS boots (wifiSkipRemaining counts down)
-//   - FORCE attempt every WIFI_FORCE_EVERY_BOOTS regardless,
-//     so data doesn't go unsynced for too long
-//   - If LittleFS is >= 60% full, always attempt WiFi (urgency override)
-#define WIFI_SKIP_AFTER_FAILURES  3    // skip after 3 consecutive failures
-#define WIFI_SKIP_BOOTS           5    // skip next 5 boots after threshold
-#define WIFI_FORCE_EVERY_BOOTS    8    // force attempt every 8 boots no matter what
-RTC_DATA_ATTR uint32_t wifiFailStreak    = 0;   // consecutive failed boots
-RTC_DATA_ATTR uint32_t wifiSkipRemaining = 0;   // boots left to skip
+// wifiFailStreak survives sleep and does one job: after several failures in
+// a row it stops the device retrying unknown OPEN networks every boot, which
+// is what a nearby captive portal would otherwise cost. The scan and the
+// saved-network connect are never skipped.
+#define WIFI_OPEN_SKIP_AFTER_FAILURES  5   // stop trying open APs after this many
+RTC_DATA_ATTR uint32_t wifiFailStreak    = 0;   // consecutive offline boots
 RTC_DATA_ATTR uint32_t bootsSinceSync    = 0;   // boots since last successful sync
-RTC_DATA_ATTR uint32_t bootsSinceAttempt = 0;   // V8-4: boots since last WiFi attempt
+RTC_DATA_ATTR uint32_t bootsSinceAttempt = 0;   // boots since last WiFi attempt
 RTC_DATA_ATTR uint32_t lastNtpDay        = 0;   // V8-14: day number of the last NTP sync
 String deviceId = "";                            // V8-13
 
@@ -408,6 +411,66 @@ int countLinesSd(const char* path) {
 }
 
 // ============================================================
+//  V8-16: CLOCK FROM THE HTTP "Date:" HEADER
+//
+//  This device usually reaches the internet through a farmer's phone
+//  hotspot, and phone hotspots routinely block NTP (UDP port 123). A
+//  field log from 2026-09-09 shows exactly that: the upload succeeded
+//  while NTP timed out. So NTP alone cannot be trusted to correct the
+//  clock here.
+//
+//  Every HTTP response carries a "Date:" header in GMT, including the
+//  302 redirect that Apps Script returns. It costs nothing extra: the
+//  bytes are already being read. Accuracy is a second or two, which is
+//  far better than a drifting or unset RTC.
+// ============================================================
+#define TZ_OFFSET_SECONDS 19800   // IST, UTC+5:30
+
+void applyHttpDate(String v) {
+  v.trim();
+  // RFC 7231 preferred form: "Tue, 09 Sep 2026 07:50:33 GMT"
+  int comma = v.indexOf(',');
+  if (comma >= 0) v = v.substring(comma + 1);
+  v.trim();
+
+  int  d = 0, y = 0, hh = 0, mi = 0, ss = 0;
+  char mon[8] = {0};
+  if (sscanf(v.c_str(), "%d %7s %d %d:%d:%d", &d, mon, &y, &hh, &mi, &ss) != 6) return;
+
+  static const char* MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char* hit = strstr(MONTHS, mon);
+  if (!hit) return;
+  int mo = (int)((hit - MONTHS) / 3) + 1;
+
+  // Reject anything implausible rather than corrupting a good clock.
+  if (y < 2025 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 ||
+      hh > 23 || mi > 59 || ss > 59) return;
+
+  DateTime utc(y, mo, d, hh, mi, ss);
+  DateTime local = utc + TimeSpan(TZ_OFFSET_SECONDS);
+
+  // Give the ESP32's own clock a valid time too, so a unit whose DS3231
+  // is missing or dead still produces usable timestamps.
+  setenv("TZ", "IST-5:30", 1);
+  tzset();
+  struct timeval tv = { (time_t)utc.unixtime(), 0 };
+  settimeofday(&tv, nullptr);
+  ntpReady = true;
+
+  if (rtcReady) {
+    long drift = (long)local.unixtime() - (long)rtc.now().unixtime();
+    if (!clockValid() || labs(drift) > 30) {
+      rtc.adjust(local);
+      lastNtpDay = (uint32_t)(local.unixtime() / 86400UL);
+      log_msg("[CLOCK] Corrected from HTTP Date header (was off by " +
+              String(drift) + " s).");
+    }
+  } else {
+    log_msg("[CLOCK] Set from HTTP Date header (no DS3231 fitted).");
+  }
+}
+
+// ============================================================
 //  APPEND helpers
 // ============================================================
 void appendToLfs(const String& jsonLine) {
@@ -492,6 +555,8 @@ String rawHttpRequest(const String& method, const String& host, const String& pa
     if (lineLower.startsWith("location:")) {
       location = line.substring(9);   // length of "location:" = 9
       location.trim();
+    } else if (lineLower.startsWith("date:")) {
+      applyHttpDate(line.substring(5));   // V8-16: free, accurate clock source
     }
   }
 
@@ -1024,31 +1089,35 @@ void setup() {
   // with setInsecure() — no global client needed.
 
   // ============================================================
-  //  WiFi STATE MACHINE — with battery-saving backoff
+  //  WiFi STATE MACHINE — scan first, then decide  (V8-17)
   //
-  //  In agricultural fields WiFi is absent most of the time.
-  //  Scanning + connection attempts cost 150-180mA for up to 60s
-  //  per boot — on a 3000mAh battery this alone cuts life by ~50%
-  //  when WiFi is consistently unavailable.
+  //  This unit lives offline. It buffers readings in flash and depends on
+  //  catching a farmer's phone hotspot during the short window it is
+  //  switched on. Two consequences shape this code:
   //
-  //  Backoff logic (all state stored in RTC memory, survives sleep):
-  //   • Each failed boot → wifiFailStreak++
-  //   • Each success    → wifiFailStreak=0, wifiSkipRemaining=0
-  //   • streak >= threshold → skip WiFi for WIFI_SKIP_BOOTS boots
-  //   • Force attempt every WIFI_FORCE_EVERY_BOOTS regardless
-  //   • LittleFS >= 60% full → always try (data urgency override)
+  //   1. Never go deaf. The previous design skipped WiFi entirely for five
+  //      boots after three failures — five hours at the default interval,
+  //      which is exactly how a visiting farmer's hotspot gets missed. We
+  //      now look on every single wake.
+  //
+  //   2. Scanning is not the expensive part. A scan takes about 2.5 s; a
+  //      blind WiFi.begin() to an absent access point costs the full 15 s
+  //      timeout, and in a field the access point is absent most of the
+  //      time. So we scan once, then spend connect time only on a network
+  //      we can actually see. Looking every boot this way is cheaper than
+  //      the old backoff was on the boots it did not skip.
+  //
+  //  wifiFailStreak survives deep sleep and still guards the open-network
+  //  fallback, so a permanently visible captive portal cannot burn radio
+  //  time forever.
   // ============================================================
   bool internetReady  = false;
   bool attemptWifi    = true;
   bootsSinceSync++;
 
-  // ── Physical reset = farmer intervention → always attempt WiFi ──
-  // When wakeup_reason is NOT timer, the device was physically reset
-  // (power cycle, reset button, brownout recovery). This is intentional
-  // user action — the farmer brought a hotspot and wants to sync.
-  // Never apply backoff in this case, regardless of fail streak.
-  // V8-5: only a genuine power-on / EN reset counts. Brownout, panic and
-  // watchdog resets are failures, not a farmer with a hotspot.
+  // V8-5: a genuine power-on or reset-button press means someone is
+  // standing at the device, so it is worth noting in the log. Brownout,
+  // panic and watchdog resets are failures, not a farmer with a hotspot.
   esp_reset_reason_t rr = esp_reset_reason();
   bool physicalReset = (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) &&
                        (rr == ESP_RST_POWERON || rr == ESP_RST_EXT || rr == ESP_RST_SW);
@@ -1057,34 +1126,19 @@ void setup() {
     log_msg("[WiFi] Abnormal reset (" + String((int)rr) + ") — counted as a failed attempt.");
   }
   if (physicalReset) {
-    wifiSkipRemaining = 0;   // clear any pending backoff
-    log_msg("[WiFi] Physical reset detected — bypassing backoff, attempting WiFi.");
+    wifiFailStreak = 0;   // someone is here; give the open-network path a clean slate
+    log_msg("[WiFi] Physical reset — fail streak cleared.");
   }
 
   float lfsNow = lfsUsageFraction();
-  bool  lfsUrgent = (lfsNow >= 0.60f);
-
-  if (physicalReset) {
-    // already handled above — always attempt
-  } else if (lfsUrgent) {
-    log_msg("[WiFi] LFS at " + String(lfsNow * 100.0f, 0) +
-            "% — forcing WiFi attempt (storage urgency).");
-    wifiSkipRemaining = 0;
-  } else if (bootsSinceAttempt >= WIFI_FORCE_EVERY_BOOTS) {   // V8-4
-    log_msg("[WiFi] " + String(bootsSinceAttempt) +
-            " boots since last attempt — forcing WiFi attempt.");
-    wifiSkipRemaining = 0;
-  } else if (wifiSkipRemaining > 0) {
-    wifiSkipRemaining--;
-    attemptWifi = false;
-    log_msg("[WiFi] Skipping WiFi (backoff). " +
-            String(wifiSkipRemaining) + " skips remain. " +
-            "Fail streak=" + String(wifiFailStreak) + ".");
+  if (lfsNow >= 0.60f) {
+    log_msg("[WiFi] Buffer at " + String(lfsNow * 100.0f, 0) + "% — sync is getting urgent.");
   }
+  log_msg("[WiFi] " + String(bootsSinceSync) + " boot(s) since the last successful sync.");
 
   bootsSinceAttempt++;
   if (attemptWifi) {
-    bootsSinceAttempt = 0;   // V8-4
+    bootsSinceAttempt = 0;
     // ── helper: clean radio reset ──
     auto wifiReset = [&]() {
       WiFi.disconnect(true, true);
@@ -1131,71 +1185,73 @@ void setup() {
 
     wifiReset();
 
-    // 1. Saved credentials
-    if (ssid_config.length() > 0) {
+    // ── V8-17 step 1: one scan, then decide ──────────────────────────
+    log_msg("[WiFi] Scanning...");
+    delay(150);
+    wdt_feed();
+
+    struct OpenNet { String ssid; int rssi; };
+    std::vector<OpenNet> openNets;
+    bool savedInRange = false;
+    int  savedRssi    = 0;
+
+    int n = WiFi.scanNetworks(false, false);
+    wdt_feed();
+    if (n > 0) {
+      log_msg("[WiFi] Found " + String(n) + " network(s):");
+      for (int i = 0; i < n; i++) {
+        String s    = WiFi.SSID(i);
+        int    rssi = WiFi.RSSI(i);
+        bool   open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        log_msg("  \"" + s + "\" RSSI=" + String(rssi) +
+                (open ? " OPEN" : " secured"));
+        if (s.length() > 0 && s == ssid_config) { savedInRange = true; savedRssi = rssi; }
+        if (open && s.length() > 0) openNets.push_back({s, rssi});
+      }
+    } else {
+      log_msg("[WiFi] Nothing on the air.");
+    }
+    WiFi.scanDelete();
+
+    // ── step 2: the saved hotspot, but only when it is actually there ──
+    if (savedInRange) {
+      log_msg("[WiFi] Saved network in range (RSSI " + String(savedRssi) + ").");
       internetReady = tryConnect(ssid_config, pass_config, 15000);
+    } else if (ssid_config.length() > 0) {
+      log_msg("[WiFi] Saved network \"" + ssid_config + "\" not in range.");
     }
 
-    // 2. Scan for open networks (only if saved creds failed)
-    if (!internetReady) {
-      log_msg("[WiFi] Scanning for open networks...");
-      delay(150);
-      wdt_feed();
-
-      struct OpenNet { String ssid; int rssi; };
-      std::vector<OpenNet> openNets;
-
-      for (int attempt = 0; attempt < 3 && openNets.empty(); attempt++) {
-        if (attempt > 0) {
-          log_msg("[WiFi] Scan retry " + String(attempt + 1) + "/3...");
-          delay(500);
-          wdt_feed();
-        }
-        int n = WiFi.scanNetworks(false, false);
-        wdt_feed();
-        if (n <= 0) { log_msg("[WiFi] Scan returned " + String(n)); continue; }
-        attempt = 3;   // V8-8: networks found — no retry even if none is open
-        log_msg("[WiFi] Found " + String(n) + " network(s):");
-        for (int i = 0; i < n; i++) {
-          String s    = WiFi.SSID(i);
-          int    rssi = WiFi.RSSI(i);
-          bool   open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
-          log_msg("  [" + String(i) + "] \"" + s + "\" RSSI=" +
-                  String(rssi) + (open ? " OPEN" : " secured"));
-          if (open && s.length() > 0) openNets.push_back({s, rssi});
-        }
-        WiFi.scanDelete();
-      }
-
-      if (openNets.empty()) {
-        log_msg("[WiFi] No open networks. Going offline.");
+    // ── step 3: fall back to open networks ──
+    // Guarded by the fail streak so a permanent captive portal nearby cannot
+    // burn 30 s of radio on every single boot forever.
+    if (!internetReady && !openNets.empty()) {
+      if (wifiFailStreak >= WIFI_OPEN_SKIP_AFTER_FAILURES) {
+        log_msg("[WiFi] " + String(openNets.size()) + " open network(s) present, but " +
+                String(wifiFailStreak) + " failures in a row — skipping them this boot.");
       } else {
         std::sort(openNets.begin(), openNets.end(),
           [](const OpenNet& a, const OpenNet& b){ return a.rssi > b.rssi; });
         int tried = 0;
         for (auto& net : openNets) {
-          if (internetReady || tried >= 2) break;    // V8-8: top 2 only
+          if (internetReady || tried >= 2) break;    // strongest two only
           internetReady = tryConnect(net.ssid, "", 10000);
           tried++;
         }
       }
     }
 
-    // ── Update backoff counters ──
+    // ── Outcome ──
+    // The streak only gates the open-network fallback (see step 3). The
+    // scan and the saved-network connect always run, so the device can
+    // never miss a hotspot window no matter how long it has been offline.
     if (internetReady) {
-      wifiFailStreak    = 0;
-      wifiSkipRemaining = 0;
-      bootsSinceSync    = 0;
-      log_msg("[WiFi] Success. Streak reset.");
+      wifiFailStreak = 0;
+      bootsSinceSync = 0;
+      log_msg("[WiFi] Online. Streak reset.");
     } else {
       wifiFailStreak++;
-      log_msg("[WiFi] Failed. Streak=" + String(wifiFailStreak));
-      if (wifiFailStreak >= WIFI_SKIP_AFTER_FAILURES) {
-        wifiSkipRemaining = WIFI_SKIP_BOOTS;
-        log_msg("[WiFi] Backoff activated — skipping next " +
-                String(WIFI_SKIP_BOOTS) + " boots.");
-      }
-      if (!internetReady) log_msg("[WiFi] Offline this boot.");
+      log_msg("[WiFi] Offline this boot. Streak=" + String(wifiFailStreak) +
+              ". Reading is stored and will go out on the next connection.");
     }
   }
 
